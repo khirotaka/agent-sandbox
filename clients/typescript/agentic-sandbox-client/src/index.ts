@@ -54,6 +54,7 @@ export type {
   SandboxdOptions,
   SandboxHealth,
   SandboxMetadata,
+  SandboxRouterOptions,
   SandboxStatus,
   StartOptions,
   VolumeClaimTemplate,

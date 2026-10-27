@@ -22,6 +22,7 @@ import {
 } from "./commands.js";
 import {
   createConnectionStrategy,
+  type ResolvedRouterOptions,
   type SandboxdConnectionStrategy,
   type SandboxdTransport,
   selectPodIP,
@@ -136,6 +137,11 @@ export async function raceWithTimeout<T>(
   }
 }
 
+// sandboxd answers 503 while it is not ready. A proxy in front of it (the
+// sandbox-router or a Gateway) answers 502 or 504 while it cannot reach
+// sandboxd yet, for example before a new Sandbox's Service resolves.
+const RETRYABLE_HEALTH_STATUSES: ReadonlySet<number> = new Set([502, 503, 504]);
+
 /** @internal — fully validated/defaulted form of SandboxdOptions. */
 export interface ResolvedSandboxdOptions {
   connectivity: SandboxdConnectivity;
@@ -148,22 +154,91 @@ export interface ResolvedSandboxdOptions {
   maxCommandOutputSize: number;
   /** Full `Authorization` header value ("Bearer <token>"), if configured. */
   authorization?: string;
+  /** Set only for "router" connectivity. */
+  router?: ResolvedRouterOptions;
 }
 
 // Printable ASCII without spaces, so the value is always a legal header value.
 // An illegal one would make fetch() throw an error that quotes the token.
 const AUTH_TOKEN_RE = /^[\x21-\x7e]+$/;
 
-function bearerAuthorization(token: string | undefined): string | undefined {
+function bearerAuthorization(
+  name: string,
+  token: string | undefined,
+): string | undefined {
   if (token === undefined) return undefined;
   // The message must not echo the token.
   if (typeof token !== "string" || !AUTH_TOKEN_RE.test(token)) {
     throw new SandboxError(
-      "sandboxd.authToken must be a non-empty string of printable ASCII characters with no spaces",
+      `${name} must be a non-empty string of printable ASCII characters with no spaces`,
       { telemetryCode: "invalid_argument" },
     );
   }
   return `Bearer ${token}`;
+}
+
+/**
+ * Validates the router URL and returns its origin. The URL may not carry a
+ * path: the router forwards the request path to sandboxd unchanged, so a
+ * prefix would reach sandboxd as part of every REST path and gRPC method.
+ * Messages never echo the URL, which could embed credentials.
+ */
+function validateRouterUrl(raw: unknown): string {
+  if (typeof raw !== "string") {
+    throw invalidArgumentError("sandboxd.router.url must be a string");
+  }
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw invalidArgumentError("sandboxd.router.url is not a valid URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw invalidArgumentError(
+      'sandboxd.router.url must use the "http:" or "https:" scheme',
+    );
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw invalidArgumentError(
+      "sandboxd.router.url must not contain credentials; use sandboxd.router.token",
+    );
+  }
+  if (url.pathname !== "/" || url.search !== "" || url.hash !== "") {
+    throw invalidArgumentError(
+      "sandboxd.router.url must not contain a path, query, or fragment",
+    );
+  }
+  return url.origin;
+}
+
+function normalizeRouterOptions(
+  connectivity: SandboxdConnectivity,
+  opts: SandboxdOptions | undefined,
+  sandboxdAuthorization: string | undefined,
+): ResolvedRouterOptions | undefined {
+  const router = opts?.router;
+  if (connectivity !== "router") {
+    if (router !== undefined) {
+      throw invalidArgumentError(
+        'sandboxd.router is only used with "router" connectivity',
+      );
+    }
+    return undefined;
+  }
+  if (typeof router !== "object" || router === null) {
+    throw invalidArgumentError(
+      'sandboxd.router is required with "router" connectivity',
+    );
+  }
+  if (sandboxdAuthorization !== undefined) {
+    throw invalidArgumentError(
+      'sandboxd.authToken is not supported with "router" connectivity: the sandbox-router removes the Authorization header before forwarding, so sandboxd would never receive the token',
+    );
+  }
+  return {
+    url: validateRouterUrl(router.url),
+    authorization: bearerAuthorization("sandboxd.router.token", router.token),
+  };
 }
 
 function validateBoundedInt(
@@ -229,10 +304,15 @@ export function normalizeSandboxdOptions(
         opts?.maxCommandOutputSize,
         0xffffffff,
       ) ?? DEFAULT_MAX_COMMAND_OUTPUT_SIZE,
-    authorization: bearerAuthorization(opts?.authToken),
+    authorization: bearerAuthorization("sandboxd.authToken", opts?.authToken),
   };
-  // With in-cluster connectivity both would dial the same pod address, so
-  // REST and gRPC must be on distinct ports; the Go client rejects this too.
+  resolved.router = normalizeRouterOptions(
+    resolved.connectivity,
+    opts,
+    resolved.authorization,
+  );
+  // Every mode ends up at the same pod address, so REST and gRPC must be on
+  // distinct ports; the Go client rejects this too.
   if (resolved.restPort === resolved.grpcPort) {
     throw new SandboxError(
       `sandboxd.restPort and sandboxd.grpcPort must differ (both ${resolved.restPort})`,
@@ -246,6 +326,7 @@ const CONNECTIVITY_VALUES: readonly SandboxdConnectivity[] = [
   "port-forward",
   "in-cluster-service",
   "in-cluster-pod-ip",
+  "router",
 ];
 
 function validateConnectivity(
@@ -440,12 +521,14 @@ export class Sandbox {
       {
         kubeConfig: init.kubeConfig,
         namespace: this.namespace,
+        sandboxName: this.sandboxName,
         podName: this.podName,
         podIP: this.podIP,
         serviceFQDN: this.serviceFQDN,
         restPort: init.sandboxdOptions.restPort,
         grpcPort: init.sandboxdOptions.grpcPort,
         handshakeTimeoutMs: init.sandboxdOptions.portForwardReadyTimeoutMs,
+        router: init.sandboxdOptions.router,
         logger: this.logger,
       },
     );
@@ -835,6 +918,7 @@ export class Sandbox {
 
       const rest = new SandboxdRestClient({
         baseUrl: transport.restBaseUrl,
+        headers: transport.restHeaders,
         maxDownloadSize: this.sandboxdOptions.maxDownloadSize,
         maxUploadSize: this.sandboxdOptions.maxUploadSize,
         maxMetadataResponseSize: this.sandboxdOptions.maxMetadataResponseSize,
@@ -844,6 +928,7 @@ export class Sandbox {
 
       const process = new ProcessClient({
         grpcBaseUrl: transport.grpcBaseUrl,
+        headers: transport.grpcHeaders,
         maxCommandOutputSize: this.sandboxdOptions.maxCommandOutputSize,
         authorization: this.sandboxdOptions.authorization,
       });
@@ -875,7 +960,8 @@ export class Sandbox {
         return;
       } catch (err) {
         const retryable =
-          (err instanceof SandboxdApiError && err.status === 503) ||
+          (err instanceof SandboxdApiError &&
+            RETRYABLE_HEALTH_STATUSES.has(err.status)) ||
           err instanceof SandboxConnectionError;
         if (!retryable) throw err;
         const terminal = transport.terminalError();

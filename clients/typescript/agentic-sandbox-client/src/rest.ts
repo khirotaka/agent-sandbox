@@ -38,6 +38,8 @@ export interface SandboxdRestClientOptions {
   maxDownloadSize: number;
   maxUploadSize: number;
   maxMetadataResponseSize: number;
+  /** Extra headers sent on every request, e.g. the router's routing headers. */
+  headers?: Readonly<Record<string, string>>;
   /** `Authorization` header value sent on every request, when set. */
   authorization?: string;
 }
@@ -486,9 +488,13 @@ export class SandboxdRestClient {
     const fetchInit: RequestInit & { duplex?: "half" } = {
       method,
       body: init.body,
-      headers: this.opts.authorization
-        ? { ...init.headers, Authorization: this.opts.authorization }
-        : init.headers,
+      headers: {
+        ...this.opts.headers,
+        ...init.headers,
+        ...(this.opts.authorization !== undefined && {
+          Authorization: this.opts.authorization,
+        }),
+      },
       // Never follow a redirect: it could carry the token to another host.
       redirect: "error",
       signal: combined,

@@ -40,6 +40,8 @@ export interface ProcessClientOptions {
   /** e.g. "http://127.0.0.1:54322", generation-scoped, never re-resolved. */
   grpcBaseUrl: string;
   maxCommandOutputSize: number;
+  /** Extra metadata sent on every RPC, e.g. the router's routing headers. */
+  headers?: Readonly<Record<string, string>>;
   /** `Authorization` header value sent on every RPC, when set. */
   authorization?: string;
 }
@@ -214,9 +216,13 @@ function createSessionManager(
   return new ClosedStreamSessionManager(baseUrl);
 }
 
-function authInterceptor(authorization: string): Interceptor {
+function headersInterceptor(
+  headers: Readonly<Record<string, string>>,
+): Interceptor {
   return (next) => (req) => {
-    req.header.set("Authorization", authorization);
+    for (const [name, value] of Object.entries(headers)) {
+      req.header.set(name, value);
+    }
     return next(req);
   };
 }
@@ -280,14 +286,21 @@ export class ProcessClient {
           deps,
           this.opts.grpcBaseUrl,
         );
+        const headers = {
+          ...this.opts.headers,
+          ...(this.opts.authorization !== undefined && {
+            authorization: this.opts.authorization,
+          }),
+        };
         const transport = deps.createGrpcTransport({
           baseUrl: this.opts.grpcBaseUrl,
           sessionManager,
           readMaxBytes: this.opts.maxCommandOutputSize,
           // One interceptor covers unary and streaming calls alike.
-          interceptors: this.opts.authorization
-            ? [authInterceptor(this.opts.authorization)]
-            : [],
+          interceptors:
+            Object.keys(headers).length > 0
+              ? [headersInterceptor(headers)]
+              : [],
         });
         if (this.closed) {
           sessionManager.abort();

@@ -269,6 +269,112 @@ describe("SandboxClient (registry)", () => {
         expect((err as SandboxError).message).not.toContain(authToken);
       }
     });
+
+    it("accepts router connectivity with a URL and token", () => {
+      expect(
+        () =>
+          new SandboxClient({
+            sandboxd: {
+              connectivity: "router",
+              router: {
+                url: "https://router.example.com:8443/",
+                token: "router.tok-1",
+              },
+            },
+          }),
+      ).not.toThrow();
+    });
+
+    it("rejects sandboxd.authToken with router connectivity", () => {
+      const err = (() => {
+        try {
+          new SandboxClient({
+            sandboxd: {
+              connectivity: "router",
+              router: { url: "http://router:8080" },
+              authToken: "sandboxd-sentinel-91c3",
+            },
+          });
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as SandboxError).telemetryCode).toBe("invalid_argument");
+      expect((err as SandboxError).message).toMatch(
+        /sandboxd\.authToken is not supported with "router" connectivity/,
+      );
+      expect((err as SandboxError).message).not.toContain(
+        "sandboxd-sentinel-91c3",
+      );
+    });
+
+    it("requires sandboxd.router with router connectivity", () => {
+      expect(
+        () => new SandboxClient({ sandboxd: { connectivity: "router" } }),
+      ).toThrow(/sandboxd\.router is required/);
+    });
+
+    it("rejects sandboxd.router without router connectivity", () => {
+      expect(
+        () =>
+          new SandboxClient({
+            sandboxd: { router: { url: "http://router:8080" } },
+          }),
+      ).toThrow(/sandboxd\.router is only used with "router" connectivity/);
+    });
+
+    it.each([
+      ["a non-string", 8080 as unknown as string, /must be a string/],
+      ["an unparsable URL", "http://[bad", /not a valid URL/],
+      ["a relative URL", "/router", /not a valid URL/],
+      ["a non-HTTP scheme", "ftp://router", /"http:" or "https:"/],
+      [
+        "credentials",
+        "http://user:secret-pw@router",
+        /must not contain credentials/,
+      ],
+      ["a path", "http://router/prefix", /path, query, or fragment/],
+      ["a query", "http://router/?a=b", /path, query, or fragment/],
+      ["a fragment", "http://router/#x", /path, query, or fragment/],
+    ])("rejects a router URL with %s", (_name, url, message) => {
+      const err = (() => {
+        try {
+          new SandboxClient({
+            sandboxd: { connectivity: "router", router: { url } },
+          });
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as SandboxError).message).toMatch(message);
+      expect((err as SandboxError).message).not.toContain("secret-pw");
+    });
+
+    it.each([
+      "",
+      "has space",
+      "t\u00f6ken",
+    ])("throws SandboxError for sandboxd.router.token = %p without echoing it", (token) => {
+      const err = (() => {
+        try {
+          new SandboxClient({
+            sandboxd: {
+              connectivity: "router",
+              router: { url: "http://router:8080", token },
+            },
+          });
+        } catch (e) {
+          return e;
+        }
+      })();
+      expect(err).toBeInstanceOf(SandboxError);
+      expect((err as SandboxError).message).toMatch(/sandboxd\.router\.token/);
+      if (token !== "") {
+        expect((err as SandboxError).message).not.toContain(token);
+      }
+    });
   });
 
   // ===== in-cluster connectivity =====
@@ -369,6 +475,22 @@ describe("SandboxClient (registry)", () => {
         SandboxNoServiceError,
       );
       expect(mockDeleteNamespacedCustomObject).not.toHaveBeenCalled();
+    });
+
+    it("router connectivity does not require a pod IP or Service", async () => {
+      mockCreateNamespacedCustomObject.mockResolvedValueOnce({});
+      mockSandboxReadyFlow("sb-router");
+
+      const client = new SandboxClient({
+        sandboxd: {
+          connectivity: "router",
+          router: { url: "http://router:8080" },
+        },
+      });
+
+      await expect(client.createSandbox("tpl")).resolves.toBeInstanceOf(
+        Sandbox,
+      );
     });
 
     it("port-forward connectivity does not require a pod IP or Service", async () => {

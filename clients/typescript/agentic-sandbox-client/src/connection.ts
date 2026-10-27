@@ -16,7 +16,7 @@ import * as net from "node:net";
 import type * as k8s from "@kubernetes/client-node";
 import {
   SandboxConnectionError,
-  type SandboxError,
+  SandboxError,
   SandboxMetadataError,
   SandboxNoServiceError,
 } from "./exceptions.js";
@@ -32,6 +32,10 @@ import type { Logger, SandboxdConnectivity } from "./types.js";
 export interface SandboxdTransport {
   readonly restBaseUrl: string;
   readonly grpcBaseUrl: string;
+  /** Extra headers sent on every REST request of this generation. */
+  readonly restHeaders?: Readonly<Record<string, string>>;
+  /** Extra metadata sent on every gRPC call of this generation. */
+  readonly grpcHeaders?: Readonly<Record<string, string>>;
   /**
    * A failure observed on this transport that retrying the health check for
    * the rest of the connect budget cannot fix, or undefined.
@@ -51,10 +55,20 @@ export interface SandboxdConnectionStrategy {
   open(): Promise<SandboxdTransport>;
 }
 
+/** @internal — validated form of SandboxRouterOptions. */
+export interface ResolvedRouterOptions {
+  /** The router's origin, e.g. "https://sandboxes.example.com". */
+  url: string;
+  /** Full `Authorization` header value ("Bearer <token>"), if configured. */
+  authorization?: string;
+}
+
 /** @internal */
 export interface ConnectionTarget {
   kubeConfig: k8s.KubeConfig;
   namespace: string;
+  /** Sandbox name, which is also its Service name. */
+  sandboxName: string;
   podName: string;
   podIP: string;
   serviceFQDN: string;
@@ -62,6 +76,8 @@ export interface ConnectionTarget {
   grpcPort: number;
   /** Budget for each port-forward WS handshake. */
   handshakeTimeoutMs: number;
+  /** Set only for "router" connectivity. */
+  router?: ResolvedRouterOptions;
   logger: Logger;
 }
 
@@ -161,6 +177,64 @@ export class InClusterStrategy implements SandboxdConnectionStrategy {
   }
 }
 
+// Routing headers the sandbox-router reads (sandbox-router/proxy/headers.go).
+// HTTP/2 requires lowercase field names.
+const ROUTER_HEADER_SANDBOX_ID = "x-sandbox-id";
+const ROUTER_HEADER_SANDBOX_NAMESPACE = "x-sandbox-namespace";
+const ROUTER_HEADER_SANDBOX_PORT = "x-sandbox-port";
+
+/**
+ * Sends REST and gRPC to the sandbox-router, which forwards each request to
+ * the Sandbox and port named in its routing headers. The router, not this
+ * process, dials the pod network, so this works with Kata and gVisor too.
+ *
+ * Every request names its port explicitly. The router has no default port
+ * for gRPC, and its HTTP default (8888) belongs to the legacy Python runtime.
+ * @internal
+ */
+export class RouterStrategy implements SandboxdConnectionStrategy {
+  readonly connectivity = "router";
+
+  constructor(
+    private readonly target: ConnectionTarget,
+    private readonly router: ResolvedRouterOptions,
+  ) {}
+
+  async open(): Promise<SandboxdTransport> {
+    const headersFor = (port: number): Record<string, string> => ({
+      [ROUTER_HEADER_SANDBOX_ID]: this.target.sandboxName,
+      [ROUTER_HEADER_SANDBOX_NAMESPACE]: this.target.namespace,
+      [ROUTER_HEADER_SANDBOX_PORT]: String(port),
+      ...(this.router.authorization !== undefined && {
+        authorization: this.router.authorization,
+      }),
+    });
+    return {
+      restBaseUrl: this.router.url,
+      grpcBaseUrl: this.router.url,
+      restHeaders: headersFor(this.target.restPort),
+      grpcHeaders: headersFor(this.target.grpcPort),
+      // The router answers rejected credentials and unknown Sandboxes with
+      // an HTTP status, which the health check already fails fast on. A
+      // connection-level failure means the router itself is not reachable
+      // yet, which the connect budget decides.
+      terminalError: () => undefined,
+      // Owns no listeners or sockets.
+      close: async () => {},
+    };
+  }
+}
+
+/** Reports whether `connectivity` dials the pod network from this process. @internal */
+export function isInClusterConnectivity(
+  connectivity: SandboxdConnectivity,
+): boolean {
+  return (
+    connectivity === "in-cluster-service" ||
+    connectivity === "in-cluster-pod-ip"
+  );
+}
+
 /**
  * Returns the address in-cluster connectivity dials, or throws when the
  * Sandbox does not have it. Called both when a handle is created (to fail
@@ -198,6 +272,15 @@ export function createConnectionStrategy(
       return new InClusterStrategy(target, false);
     case "in-cluster-service":
       return new InClusterStrategy(target, true);
+    case "router":
+      // normalizeSandboxdOptions() requires router options for this mode.
+      if (!target.router) {
+        throw new SandboxError(
+          '"router" connectivity requires sandboxd.router',
+          { telemetryCode: "invalid_argument" },
+        );
+      }
+      return new RouterStrategy(target, target.router);
     default:
       return new PortForwardStrategy(target);
   }

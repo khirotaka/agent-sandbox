@@ -17,11 +17,17 @@ import {
   createConnectionStrategy,
   formatHost,
   InClusterStrategy,
+  isInClusterConnectivity,
   PortForwardStrategy,
+  RouterStrategy,
   resolveInClusterHost,
   selectPodIP,
 } from "../connection.js";
-import { SandboxMetadataError, SandboxNoServiceError } from "../exceptions.js";
+import {
+  SandboxError,
+  SandboxMetadataError,
+  SandboxNoServiceError,
+} from "../exceptions.js";
 import { noopLogger } from "../logger.js";
 
 describe("selectPodIP", () => {
@@ -96,6 +102,7 @@ describe("createConnectionStrategy", () => {
   const target = {
     kubeConfig: {} as never,
     namespace: "default",
+    sandboxName: "sb",
     podName: "pod",
     podIP: "fd00::9",
     serviceFQDN: "sb.default.svc.cluster.local",
@@ -131,5 +138,61 @@ describe("createConnectionStrategy", () => {
     expect(transport.grpcBaseUrl).toBe(
       "http://sb.default.svc.cluster.local:9090",
     );
+  });
+
+  it("sends router traffic to the router with per-channel routing headers", async () => {
+    const strategy = createConnectionStrategy("router", {
+      ...target,
+      router: {
+        url: "https://router.example.com",
+        authorization: "Bearer router-token",
+      },
+    });
+    expect(strategy).toBeInstanceOf(RouterStrategy);
+    expect(strategy.connectivity).toBe("router");
+    const transport = await strategy.open();
+    expect(transport.restBaseUrl).toBe("https://router.example.com");
+    expect(transport.grpcBaseUrl).toBe("https://router.example.com");
+    const common = {
+      "x-sandbox-id": "sb",
+      "x-sandbox-namespace": "default",
+      authorization: "Bearer router-token",
+    };
+    expect(transport.restHeaders).toEqual({
+      ...common,
+      "x-sandbox-port": "8080",
+    });
+    expect(transport.grpcHeaders).toEqual({
+      ...common,
+      "x-sandbox-port": "9090",
+    });
+    expect(transport.terminalError()).toBeUndefined();
+    await transport.close();
+  });
+
+  it("omits authorization when the router has no token", async () => {
+    const transport = await createConnectionStrategy("router", {
+      ...target,
+      router: { url: "http://router:8080" },
+    }).open();
+    expect(transport.restHeaders).not.toHaveProperty("authorization");
+    expect(transport.grpcHeaders).not.toHaveProperty("authorization");
+  });
+
+  it("rejects router connectivity without router options", () => {
+    expect(() => createConnectionStrategy("router", target)).toThrow(
+      SandboxError,
+    );
+  });
+});
+
+describe("isInClusterConnectivity", () => {
+  it.each([
+    ["port-forward", false],
+    ["in-cluster-service", true],
+    ["in-cluster-pod-ip", true],
+    ["router", false],
+  ] as const)("%s -> %s", (connectivity, want) => {
+    expect(isInClusterConnectivity(connectivity)).toBe(want);
   });
 });

@@ -179,23 +179,25 @@ default.
 ### Timeouts
 
 - `sandboxReadyTimeout` (constructor / `createSandbox()` options) is in **seconds** and bounds waiting for the `SandboxClaim`/`Sandbox` to become `Ready`. Default: 180.
-- `sandboxd.portForwardReadyTimeoutMs` (constructor option, under `sandboxd`) is in **milliseconds** and bounds the shared connection to sandboxd, through a successful health check: for `port-forward` connectivity it starts when both local port-forward listeners are opened, and for the in-cluster modes it bounds health polling against the pod address (see [Connectivity](#connectivity)). It applies in full to every (re)connect attempt, including reconnects after a transport failure. Default: 30000.
+- `sandboxd.portForwardReadyTimeoutMs` (constructor option, under `sandboxd`) is in **milliseconds** and bounds the shared connection to sandboxd, through a successful health check: for `port-forward` connectivity it starts when both local port-forward listeners are opened, for the in-cluster modes it bounds health polling against the pod address, and for `router` connectivity it bounds health polling through the router (see [Connectivity](#connectivity)). It applies in full to every (re)connect attempt, including reconnects after a transport failure. Default: 30000.
 - Every `sandbox.files.*` / `sandbox.commands.run()` / `sandbox.health()` / `sandbox.metadata()` call takes a per-call `timeoutMs` (default 60000). This is a total budget for the call, including any time spent waiting on the shared connection above — a cold first call can spend most of its budget just connecting. For `sandbox.commands.start()` it covers only the time until the process has started (see [Interactive processes](#interactive-processes)); the calls on the returned handle each take their own `timeoutMs`.
 - `sandboxd.maxCommandOutputSize` bounds the fully-decoded `ExecuteResponse` (stdout + stderr + protobuf framing combined, not stdout alone) that `sandbox.commands.run()` will accept.
 
 ### Connectivity
 
-`sandboxd.connectivity` selects how the SDK reaches sandboxd. The values are the same as the Go client's `Connectivity`:
+`sandboxd.connectivity` selects how the SDK reaches sandboxd. The first three values are the same as the Go client's `Connectivity`:
 
 | Value | Path | Requirements |
 | --- | --- | --- |
 | `"port-forward"` (default) | WebSocket port-forward brokered by the apiserver | A kubeconfig that allows `pods/portforward`. Works from anywhere, including a laptop or CI runner. |
 | `"in-cluster-service"` | Dials the Sandbox's headless Service by DNS name (`status.serviceFQDN`) | The process runs inside the cluster, and the template sets `spec.service: true`. |
 | `"in-cluster-pod-ip"` | Dials the pod IP (`status.podIPs`, IPv4 preferred) | The process runs inside the cluster. |
+| `"router"` | Sends REST and gRPC to the [sandbox-router](../../../sandbox-router/README.md), which forwards them to the Sandbox | The process can reach the router at `sandboxd.router.url`, and the router can resolve the Sandbox (see [Through the sandbox-router](#through-the-sandbox-router)). |
 
 `"port-forward"` doesn't work on Kata or gVisor: their workload runs in a separate
 kernel, so the pod's host-side network namespace has nothing for the port-forward to
-reach — use an in-cluster mode (the Sandbox NetworkPolicy must admit the client).
+reach — use an in-cluster mode (the Sandbox NetworkPolicy must admit the client) or
+`"router"` (the Sandbox NetworkPolicy must admit the router).
 
 ```ts
 const client = new SandboxClient({
@@ -211,6 +213,29 @@ The in-cluster modes take the apiserver off the data path. Each uses exactly one
 
 The addresses are available on the handle as `sandbox.podIP` and `sandbox.serviceFQDN`. They are `""` when unknown.
 
+#### Through the sandbox-router
+
+With `"router"` connectivity, the SDK sends every REST request and gRPC call to the sandbox-router at `sandboxd.router.url`. The router forwards each one to the Sandbox named in its routing headers. The router needs a release with native gRPC proxying.
+
+```ts
+const client = new SandboxClient({
+  sandboxd: {
+    connectivity: "router",
+    router: {
+      url: "http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080",
+      token: process.env.SANDBOX_ROUTER_TOKEN, // only with router authz
+    },
+  },
+});
+```
+
+- The SDK sends `X-Sandbox-ID` (the Sandbox name), `X-Sandbox-Namespace`, and `X-Sandbox-Port` on every request. `X-Sandbox-Port` is `sandboxd.restPort` for REST and `sandboxd.grpcPort` for gRPC.
+- `sandboxd.router.url` takes only a scheme, host, and port. A path, query, fragment, or credentials in it are rejected, because the router forwards the request path to sandboxd unchanged.
+- The router resolves the Sandbox through its Service (`<name>.<namespace>.svc`), so the template needs `spec.service: true` unless the router runs with its Pod-IP cache enabled. The SDK cannot tell which one the router uses, so `createSandbox()` / `getSandbox()` do not check for a Service in this mode. A Sandbox the router cannot reach fails the first `files` / `commands` call.
+- Use an `https:` URL when the router or a Gateway in front of it terminates TLS. The SDK uses Node's default CA store; set `NODE_EXTRA_CA_CERTS` for a private CA. With an `http:` URL, everything, including the router token, travels in plaintext.
+- The router keeps its own per-request limits. Its `--proxy-timeout` (default 180 s) bounds each REST request, including file transfers, independently of `timeoutMs`. Its `--max-request-body-bytes` limits uploads. gRPC calls have no router limit by default.
+- While the router answers 502 or 504 during the connect health check (it cannot reach sandboxd yet), the SDK keeps polling within `sandboxd.portForwardReadyTimeoutMs`. Any other error status from the router, such as 401 or 403, fails the call immediately with `SandboxdApiError`.
+
 ### Authentication
 
 If sandboxd runs with `--auth-token-sha256` or `--auth-token-file`, pass the token as `sandboxd.authToken`:
@@ -224,6 +249,11 @@ const client = new SandboxClient({
 The SDK sends it as `Authorization: Bearer <token>` on every REST request and gRPC call, and never logs it or puts it in a trace or error. It must be non-empty printable ASCII with no spaces. A missing or wrong token fails the call with `SandboxdApiError` (`code: "UNAUTHENTICATED"`) for files and metadata, and `SandboxdRpcError` (`code: "unauthenticated"`) for commands. `GET /v1/health` needs no token, so the connect health check passes even with a wrong one and the first real call reports it.
 
 With `port-forward` the token rides the TLS connection to the apiserver. sandboxd has no TLS, so with the in-cluster modes it is sent in plaintext, and `in-cluster-pod-ip` can send it to an unrelated pod if the IP was reassigned. Prefer `in-cluster-service` or `port-forward`. See [Trust boundary](#trust-boundary).
+
+`sandboxd.authToken` cannot be combined with `"router"` connectivity, and the `SandboxClient` constructor throws a `SandboxError` when both are set. The sandbox-router removes the `Authorization` header before it forwards a request, so the token would never reach sandboxd. Through the router, run sandboxd without `--auth-token-*`, and authenticate to the router instead:
+
+- If the router runs with `--authz-mode=scoped-token` or `--authz-mode=tokenreview`, pass its token as `sandboxd.router.token`. The SDK sends it as `Authorization: Bearer <token>` on every REST request and gRPC call, under the same rules as `sandboxd.authToken`. The router consumes the header and does not forward it.
+- The SDK reads the token once, when the `SandboxClient` is constructed. To use a new token after an expiring one runs out, construct a new `SandboxClient`.
 
 ### Streaming
 
@@ -353,16 +383,20 @@ With `port-forward` connectivity, the local TCP listeners the SDK opens for its 
 
 With the in-cluster modes, REST and gRPC travel in plaintext across the pod network. Unless sandboxd requires a token, anything that can reach the sandbox pod on those ports can use its files/run API, and with a token the token itself is sent in plaintext. Restrict that access with a NetworkPolicy or a service mesh.
 
+With `router` connectivity, the router's authorization protects only the path through the router, and TLS (when used) protects only the hop to the router or Gateway. The router forwards to sandboxd in plaintext, and sandboxd runs without a token, so anything that can reach the sandbox pod on sandboxd's ports bypasses the router. Restrict ingress to sandboxd's ports to the router with a NetworkPolicy.
+
 ### Differences from the Go and Python clients
 
 - `run()` takes an argv (`command`, `args`) mirroring sandboxd's `ProcessConfig`, plus `env` and `cwd`; the Go/Python clients take a single shell string that they wrap in `/bin/sh -c`.
 - File paths are never recorded in tracing spans or logs (only counts/sizes/booleans are), and absolute paths / `..` segments are rejected by the client itself before any request is sent.
+- `"router"` connectivity has no Go or Python equivalent. Those clients reach the sandbox-router only with the legacy python-runtime.
 - RuntimeClass (gVisor/Kata) is not observed or branched on anywhere in this layer; conformance on non-default runtimes is tracked separately and is not implied by this SDK's tests passing on a standard cluster.
 
 ### Not supported
 
 - The legacy python-runtime. The SDK only talks to sandboxd.
-- The Gateway and Direct connection modes, and access to sandboxd through sandbox-router ([#1889](https://github.com/kubernetes-sigs/agent-sandbox/issues/1889)). Use one of the `sandboxd.connectivity` values above.
+- The Gateway and Direct connection modes, which discover or take the address of a router for the legacy python-runtime. Use one of the `sandboxd.connectivity` values above; `"router"` takes the router's URL directly.
+- `sandboxd.authToken` with `"router"` connectivity. See [Authentication](#authentication).
 
 ## Publishing status
 

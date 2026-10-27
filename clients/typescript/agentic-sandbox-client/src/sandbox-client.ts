@@ -14,7 +14,11 @@
 
 import * as crypto from "node:crypto";
 import * as k8s from "@kubernetes/client-node";
-import { resolveInClusterHost, selectPodIP } from "./connection.js";
+import {
+  isInClusterConnectivity,
+  resolveInClusterHost,
+  selectPodIP,
+} from "./connection.js";
 import {
   CLAIM_API_GROUP,
   CLAIM_API_VERSION,
@@ -1681,7 +1685,7 @@ export class SandboxClient {
   /** False when an in-cluster mode has no address to dial for this handle. */
   private hasConnectionAddress(sandbox: Sandbox): boolean {
     const { connectivity } = this.sandboxdOptions;
-    if (connectivity === "port-forward") return true;
+    if (!isInClusterConnectivity(connectivity)) return true;
     try {
       resolveInClusterHost(connectivity, sandbox.podIP, sandbox.serviceFQDN);
       return true;
@@ -1855,7 +1859,7 @@ export class SandboxClient {
       );
       // Fail here rather than on the first files/commands call, the same
       // point at which the Go client's Open() fails.
-      if (this.sandboxdOptions.connectivity !== "port-forward") {
+      if (isInClusterConnectivity(this.sandboxdOptions.connectivity)) {
         resolveInClusterHost(
           this.sandboxdOptions.connectivity,
           ready.podIP,

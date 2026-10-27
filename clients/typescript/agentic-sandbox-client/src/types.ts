@@ -100,13 +100,45 @@ export interface SandboxdOptions {
    * request and gRPC call, and never logged or put in an error. It is not
    * encrypted on the wire: with the in-cluster modes it travels in plaintext.
    * Must be non-empty printable ASCII with no spaces. Default: none.
+   *
+   * Not supported with `"router"` connectivity: the sandbox-router removes
+   * the `Authorization` header before it forwards a request, so the token
+   * would never reach sandboxd. The SandboxClient constructor throws when
+   * both are set.
    */
   authToken?: string;
+  /**
+   * Where the sandbox-router is and how to authenticate to it. Required with
+   * `"router"` connectivity and rejected with every other mode.
+   */
+  router?: SandboxRouterOptions;
+}
+
+/** Configures `"router"` connectivity. */
+export interface SandboxRouterOptions {
+  /**
+   * Base URL of the sandbox-router, or of a Gateway in front of it, for
+   * example
+   * `"http://sandbox-router-svc.agent-sandbox-system.svc.cluster.local:8080"`
+   * or `"https://sandboxes.example.com"`. Use `http:` only on a trusted
+   * network: the SDK then sends every request, including `token`, in
+   * plaintext. The URL must not contain a path, query, fragment, or
+   * credentials.
+   */
+  url: string;
+  /**
+   * Bearer token for a router started with `--authz-mode=scoped-token` or
+   * `--authz-mode=tokenreview`. Sent as `Authorization: Bearer <token>` on
+   * every REST request and gRPC call, and never logged or put in an error.
+   * The router consumes the header and does not forward it to sandboxd.
+   * Must be non-empty printable ASCII with no spaces. Default: none.
+   */
+  token?: string;
 }
 
 /**
  * Transport used to reach sandboxd. Same values as the Go client's
- * Connectivity.
+ * Connectivity, plus `"router"`.
  *
  * - `"port-forward"`: a WebSocket port-forward brokered by the apiserver.
  *   Works from anywhere a kubeconfig does, including a laptop or CI runner.
@@ -123,15 +155,23 @@ export interface SandboxdOptions {
  *   Service, but nothing detects that the pod was rescheduled: requests can
  *   continue to a stale address Kubernetes may have reassigned to an
  *   unrelated pod.
+ * - `"router"`: sends REST and gRPC to the sandbox-router at
+ *   `router.url`, which forwards each request to the Sandbox named in its
+ *   `X-Sandbox-*` headers. Works from anywhere that can reach the router, and
+ *   with Kata or gVisor, because the router dials the pod network. The router
+ *   resolves the Sandbox by its Service name unless its Pod-IP cache is
+ *   enabled, so a Sandbox without `spec.service: true` needs that cache.
+ *   Cannot be combined with `authToken`; see {@link SandboxdOptions.authToken}.
  *
  * Both in-cluster modes require this process to run inside the same cluster
  * as the sandbox pods, and send REST and gRPC in plaintext across the pod
- * network.
+ * network. The router always forwards to sandboxd in plaintext.
  */
 export type SandboxdConnectivity =
   | "port-forward"
   | "in-cluster-service"
-  | "in-cluster-pod-ip";
+  | "in-cluster-pod-ip"
+  | "router";
 
 /**
  * Options accepted by every call that reaches the sandbox runtime:

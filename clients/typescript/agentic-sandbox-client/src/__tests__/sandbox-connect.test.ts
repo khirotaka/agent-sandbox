@@ -37,6 +37,7 @@ import {
 import {
   SandboxClosedError,
   SandboxConnectionError,
+  SandboxdApiError,
   SandboxdRpcError,
   SandboxError,
   SandboxTimeoutError,
@@ -45,7 +46,11 @@ import { noopLogger } from "../logger.js";
 import type { SandboxInit } from "../sandbox.js";
 import { normalizeSandboxdOptions, Sandbox } from "../sandbox.js";
 import type { Span, Tracer, TracerManager } from "../trace-manager.js";
-import type { ProcessEvent, SandboxdConnectivity } from "../types.js";
+import type {
+  ProcessEvent,
+  SandboxdConnectivity,
+  SandboxRouterOptions,
+} from "../types.js";
 
 // ---------- fake apiserver: routes by the requested target port to one of
 // two real backends (REST / gRPC), mirroring how sandboxd exposes both ports
@@ -153,11 +158,14 @@ async function startRestBackend(
   port: number;
   healthHits: number;
   putBodies: Buffer[];
+  requestHeaders: http.IncomingHttpHeaders[];
   close(): Promise<void>;
 }> {
   const counter = { healthHits: 0 };
   const putBodies: Buffer[] = [];
+  const requestHeaders: http.IncomingHttpHeaders[] = [];
   const server = http.createServer((req, res) => {
+    requestHeaders.push(req.headers);
     // Like sandboxd's --auth-token-*: everything but /v1/health needs the token.
     if (
       requiredAuthorization !== undefined &&
@@ -241,6 +249,7 @@ async function startRestBackend(
       return counter.healthHits;
     },
     putBodies,
+    requestHeaders,
     close: () => new Promise((resolve) => server.close(() => resolve())),
   };
 }
@@ -297,6 +306,7 @@ function makeSandbox(overrides: {
   podIP?: string;
   serviceFQDN?: string;
   authToken?: string;
+  router?: SandboxRouterOptions;
 }): Sandbox {
   const init: SandboxInit = {
     claimName: "test-claim",
@@ -316,6 +326,7 @@ function makeSandbox(overrides: {
       grpcPort: overrides.grpcPort,
       portForwardReadyTimeoutMs: 5000,
       authToken: overrides.authToken,
+      router: overrides.router,
     }),
     tracingManager: overrides.tracingManager ?? null,
     traceServiceName: "test",
@@ -997,6 +1008,190 @@ describe("Sandbox in-cluster connectivity", () => {
     const content = await sandbox.files.read("a.txt");
     expect(new TextDecoder().decode(content)).toBe("file contents");
     expect(restBackend.healthHits).toBe(2);
+  });
+});
+
+// ---------- fake sandbox-router: one port for HTTP/1.1 REST and h2c gRPC,
+// like the real router's proxy listener. It routes each connection by its
+// protocol, so the backends see the SDK's headers unchanged. ----------
+
+const HTTP2_PREFACE = Buffer.from("PRI * HTTP/2.0");
+
+async function startFakeRouter(
+  restPort: number,
+  grpcPort: number,
+): Promise<{ port: number; close(): Promise<void> }> {
+  const sockets = new Set<net.Socket>();
+  const track = (socket: net.Socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  };
+  const server = net.createServer((client) => {
+    track(client);
+    client.once("data", (first: Buffer) => {
+      const isHttp2 = first
+        .subarray(0, HTTP2_PREFACE.length)
+        .equals(HTTP2_PREFACE);
+      const upstream = net.connect(isHttp2 ? grpcPort : restPort, "127.0.0.1");
+      track(upstream);
+      upstream.write(first);
+      client.pipe(upstream).pipe(client);
+      client.on("error", () => upstream.destroy());
+      upstream.on("error", () => client.destroy());
+      client.on("close", () => upstream.destroy());
+      upstream.on("close", () => client.destroy());
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (!addr || typeof addr === "string")
+    throw new Error("failed to bind fake router");
+  return {
+    port: addr.port,
+    close: () =>
+      new Promise((resolve) => {
+        for (const socket of sockets) socket.destroy();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** An HTTP/1.1 router that answers /v1/health with `respond`. */
+async function startHealthOnlyRouter(
+  respond: (hit: number, res: http.ServerResponse) => void,
+): Promise<{ port: number; healthHits: number; close(): Promise<void> }> {
+  const counter = { healthHits: 0 };
+  const server = http.createServer((req, res) => {
+    if (req.url === "/v1/health") {
+      respond(++counter.healthHits, res);
+      return;
+    }
+    res.writeHead(200, { "Content-Type": "application/octet-stream" });
+    res.end("file contents");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const addr = server.address();
+  if (!addr || typeof addr === "string")
+    throw new Error("failed to bind health-only router");
+  return {
+    port: addr.port,
+    get healthHits() {
+      return counter.healthHits;
+    },
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+describe("Sandbox router connectivity", () => {
+  let router: { close(): Promise<void> } | undefined;
+
+  afterEach(async () => {
+    await router?.close();
+    router = undefined;
+  });
+
+  it("sends REST and gRPC to one router URL with routing headers and the router token", async () => {
+    const grpcHeaders: Headers[] = [];
+    restBackend = await startRestBackend();
+    grpcBackend = await startGrpcBackend((r) => {
+      r.service(ProcessService, {
+        execute: (_req, ctx) => {
+          grpcHeaders.push(ctx.requestHeader);
+          return create(ExecuteResponseSchema, {
+            exitCode: 0,
+            stdout: new TextEncoder().encode("routed\n"),
+            stderr: new Uint8Array(),
+          });
+        },
+      });
+    });
+    const fakeRouter = await startFakeRouter(
+      restBackend.port,
+      grpcBackend.port,
+    );
+    router = fakeRouter;
+    sandbox = makeSandbox({
+      apiServerPort: UNUSED_API_SERVER_PORT,
+      restPort: 18080,
+      grpcPort: 19090,
+      connectivity: "router",
+      router: {
+        url: `http://127.0.0.1:${fakeRouter.port}`,
+        token: "router-tok",
+      },
+    });
+
+    const content = await sandbox.files.read("a.txt");
+    expect(new TextDecoder().decode(content)).toBe("file contents");
+    const result = await sandbox.commands.run("echo", ["routed"]);
+    expect(result).toEqual({ exitCode: 0, stdout: "routed\n", stderr: "" });
+
+    // The health check and the read both carry the REST routing headers.
+    expect(restBackend.requestHeaders).toHaveLength(2);
+    for (const headers of restBackend.requestHeaders) {
+      expect(headers).toMatchObject({
+        "x-sandbox-id": "test-sandbox",
+        "x-sandbox-namespace": "default",
+        "x-sandbox-port": "18080",
+        authorization: "Bearer router-tok",
+      });
+    }
+    expect(grpcHeaders).toHaveLength(1);
+    const rpcHeaders = grpcHeaders[0] as Headers;
+    expect(rpcHeaders.get("x-sandbox-id")).toBe("test-sandbox");
+    expect(rpcHeaders.get("x-sandbox-namespace")).toBe("default");
+    expect(rpcHeaders.get("x-sandbox-port")).toBe("19090");
+    expect(rpcHeaders.get("authorization")).toBe("Bearer router-tok");
+  });
+
+  it("fails fast with the router's status when it rejects the request", async () => {
+    const rejecting = await startHealthOnlyRouter((_hit, res) => {
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ detail: "token does not grant this sandbox" }));
+    });
+    router = rejecting;
+    sandbox = makeSandbox({
+      apiServerPort: UNUSED_API_SERVER_PORT,
+      restPort: 18080,
+      grpcPort: 19090,
+      connectivity: "router",
+      router: { url: `http://127.0.0.1:${rejecting.port}` },
+    });
+
+    const err = await sandbox.files.read("a.txt").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(SandboxdApiError);
+    expect(err).toMatchObject({ status: 403 });
+    expect(rejecting.healthHits).toBe(1);
+  });
+
+  it("keeps polling health while the router cannot reach sandboxd yet", async () => {
+    const flaky = await startHealthOnlyRouter((hit, res) => {
+      if (hit <= 2) {
+        res.writeHead(hit === 1 ? 502 : 504, {
+          "Content-Type": "application/json",
+        });
+        res.end(JSON.stringify({ detail: "Could not connect" }));
+        return;
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", uptime_seconds: 1 }));
+    });
+    router = flaky;
+    sandbox = makeSandbox({
+      apiServerPort: UNUSED_API_SERVER_PORT,
+      restPort: 18080,
+      grpcPort: 19090,
+      connectivity: "router",
+      router: { url: `http://127.0.0.1:${flaky.port}` },
+    });
+
+    const content = await sandbox.files.read("a.txt");
+    expect(new TextDecoder().decode(content)).toBe("file contents");
+    expect(flaky.healthHits).toBe(3);
   });
 });
 
